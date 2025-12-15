@@ -1,0 +1,9 @@
+pandas>=2.2.3
+numpy>=1.26.4
+
+# Jupyter and interactive tools
+ipykernel>=6.29
+ipython>=8.12
+jupyterlab>=4.4.7
+notebook>=7.4.7
+ipywidgets>=8.1.7

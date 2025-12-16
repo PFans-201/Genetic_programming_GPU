@@ -1,0 +1,12 @@
+\begin{table}
+\caption{Statistical Significance of Execution Times}
+\begin{tabular}{l|l|l|l|l}
+\toprule
+Comparison & Mean 1 & Mean 2 & p-value & Significant \\
+\midrule
+Sequential CPU vs Naive CuPy & 2.7813 & 0.3670 & 3.0199e-11 & Yes \\
+Sequential CPU vs Mega-Kernel GPU & 2.7813 & 0.0024 & 3.0199e-11 & Yes \\
+Naive CuPy vs Mega-Kernel GPU & 0.3670 & 0.0024 & 3.0199e-11 & Yes \\
+\bottomrule
+\end{tabular}
+\end{table}

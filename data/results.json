@@ -1,0 +1,29 @@
+{
+  "N": 100000,
+  "FEATURES": 15,
+  "python": "3.12.12",
+  "gpu_available": true,
+  "gpu_name": "NVIDIA A100-SXM4-40GB",
+  "best_batch_size": 512,
+  "compilation_time_s": 0.0005773600000793522,
+  "modes": {
+    "Sequential CPU": {
+      "mean_time": 2.781320725133336,
+      "std_time": 0.01604836238449186,
+      "mean_best_score": 0.05903424488836298,
+      "min_best_score": 0.059034244888362994
+    },
+    "Naive CuPy": {
+      "mean_time": 0.36702913846666546,
+      "std_time": 0.05815012647167527,
+      "mean_best_score": 0.05903424322605133,
+      "min_best_score": 0.05903424322605133
+    },
+    "Mega-Kernel GPU": {
+      "mean_time": 0.002364728000005319,
+      "std_time": 1.2656524500078175e-05,
+      "mean_best_score": 0.05903424322605133,
+      "min_best_score": 0.05903424322605133
+    }
+  }
+}

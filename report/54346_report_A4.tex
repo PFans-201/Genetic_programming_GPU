@@ -1,4 +1,4 @@
-\documentclass[a4paper,10pt,twocolumn]{article}
+\documentclass[a4paper,10pt]{article}
 \usepackage[utf8]{inputenc}
 \usepackage{amsmath}
 \usepackage{graphicx}
@@ -6,8 +6,12 @@
 \usepackage{xcolor}
 \usepackage{geometry}
 \usepackage{float}
+\usepackage{booktabs}
+\usepackage{caption}
+\usepackage{hyperref}
 
 \geometry{top=2cm, bottom=2cm, left=1.5cm, right=1.5cm}
+\graphicspath{{../data/}}
 
 \lstset{
     basicstyle=\ttfamily\scriptsize,
@@ -19,11 +23,12 @@
     commentstyle=\color{gray},
     stringstyle=\color{red},
     showstringspaces=false,
-    captionpos=b
+    captionpos=b,
+    language=C++
 }
 
 \title{Massively Parallel Symbolic Regression: A CUDA-Accelerated Genetic Programming Architecture}
-\author{Research Report}
+\author{Student: Pedro Fanica (54346)\\Course: Parallel and Concurrent Programming\\Prof: Wellington Oliveira\\Faculdade de Ciências da Universidade de Lisboa}
 \date{\today}
 
 \begin{document}
@@ -31,204 +36,187 @@
 \maketitle
 
 \begin{abstract}
-This report presents an architectural analysis and implementation strategy for accelerating Symbolic Regression, a subfield of Genetic Programming (GP), using Graphics Processing Units (GPUs). The objective was to design a high-throughput evaluation engine to minimize the Mean Square Error (MSE) of candidate mathematical expressions against a large-scale dataset ($N=100,000$). We implemented a hybrid Python-CUDA approach using CuPy's \texttt{RawKernel} interface, achieving massive parallelism across both data rows and candidate functions. Our "Mega-Kernel" design incorporates dynamic runtime compilation, automated batch size tuning, and high-precision benchmarking. Results demonstrate that the GPU implementation significantly outperforms sequential CPU execution, with detailed analysis provided on the impact of dataset size ($N$) and feature dimensionality ($D$).
+This report details the implementation of a CUDA-accelerated evaluation engine for Symbolic Regression. Addressing specific architectural challenges, I designed and implemented a ``Mega-Kernel'' approach that fuses thousands of population individuals into a single kernel launch. The report explicitly addresses the assignment requirements regarding parallelization strategies, memory management, and warp divergence. Experimental results on a dataset of $N=10^8$ rows demonstrate that while Naive CuPy offers competitive performance at mid-range data sizes ($10^7$), the Mega-Kernel architecture scales superiorly at the extremes, achieving a speedup of $>1000\times$ over the CPU baseline.
 \end{abstract}
 
 \section{Introduction}
-\subsection{The Evaluation Bottleneck}
-Genetic Programming (GP) distinguishes itself from other machine learning paradigms by evolving the model structure itself. In Symbolic Regression, the fitness of individuals is determined by their predictive accuracy against a target dataset. The computational cost is $O(P \times G \times N \times \bar{S})$, where $P$ is population size, $G$ generations, $N$ rows, and $\bar{S}$ average tree size.
-With modern datasets often exceeding $10^5$ rows and populations requiring $10^3$ individuals, a single run can demand trillions of floating-point operations. Sequential CPU execution fails to scale, severely limiting search space exploration.
+Genetic Programming (GP) requires evaluating thousands of candidate functions against large datasets (fitness evaluation). This process is the primary bottleneck, often consuming $>95\%$ of runtime. Sequential CPU execution is insufficient for modern scale. This report evaluates three implementation strategies: Sequential CPU, Naive CuPy (high-level API), and a Custom ``Mega-Kernel'' CUDA approach, specifically answering architectural questions regarding parallelization and memory hierarchy.
 
-\subsection{GPU Architecture Suitability}
-GPUs are theoretically optimal due to two dimensions of parallelism:
-\begin{itemize}
-    \item \textbf{Data Parallelism:} A single candidate function must be evaluated across all $N$ rows.
-    \item \textbf{Task Parallelism:} Multiple distinct candidate functions ($P$) must be evaluated simultaneously.
-\end{itemize}
-However, the irregular nature of GP trees causes warp divergence, challenging Single Instruction, Multiple Threads (SIMT) architectures.
+\section{Architectural Implementation}
 
-\section{Methodology}
-\subsection{Technology Selection}
-We compared three potential pathways: Numba, PyTorch, and CuPy.
-
-\subsubsection{Numba: The "Bad Stride" Pitfall}
-Numba offers convenient JIT compilation but suffers from memory access patterns if not managed manually. If a kernel is written naively where thread $id$ accesses index $id$ of a row-major array, consecutive threads access non-consecutive memory addresses. This forces the memory controller to service separate transactions, reducing effective bandwidth by up to 80\%.
-
-\subsubsection{PyTorch: Kernel Launch Latency}
-PyTorch evaluates expressions like \texttt{sin(x) + cos(x)} by launching separate kernels for each operation. For a GP tree with 50 nodes, this results in 50 kernel launches per individual. With $P=1000$, this triggers 50,000 launches per generation, causing massive driver overhead.
-
-\subsubsection{CuPy \& RawKernel (Selected)}
-We selected CuPy with \texttt{RawKernel} as it allows dynamic compilation of C++ CUDA code strings. This enables "Kernel Fusion," where the entire expression tree is compiled into a single kernel, and provides direct control over memory layout.
-
-\subsection{Data Layout Optimization}
-To resolve "bad stride" issues, input data was transposed from Row-Major to \textbf{Column-Major (Structure of Arrays)}.
-In this layout, all values for feature $A$ are contiguous. When a warp of 32 threads executes a grid-stride loop, Thread $k$ reads Row $k$ and Thread $k+1$ reads Row $k+1$, which are adjacent in memory. This results in coalesced memory transactions, maximizing bandwidth.
-
-\subsection{Reproducibility and Data Persistence}
-To ensure experiments are reproducible across sessions (e.g., Google Colab) while avoiding unnecessary regeneration of inputs, the implementation:
-\begin{itemize}
-    \item Mounts Google Drive on Colab and stores artifacts under \texttt{MyDrive/Genetic\_programming\_GPU/data}; locally, files live under the repository's \texttt{data/}.
-    \item Generates \texttt{data.csv} and \texttt{functions.txt} only once and records the parameters in \texttt{gen\_meta.json} (\texttt{N}, \texttt{FEATURES}, \texttt{SEED}).
-    \item Regenerates inputs only when these parameters change, otherwise reuses persisted files.
-    \item Persists benchmark timings to \texttt{results.json} for later inclusion in reports.
-\end{itemize}
-
-\section{Parallel Architecture Design}
-\subsection{Hybrid "Mega-Kernel" Mapping}
-We adopted a 2D Grid/Block mapping to exploit both data and task parallelism:
-\begin{itemize}
-    \item \textbf{Grid (Y-dim):} Maps to Population (Functions). \texttt{blockIdx.y} corresponds to the function index.
-    \item \textbf{Blocks/Threads (X-dim):} Map to Data Rows. Threads utilize a Grid-Stride Loop to iterate over the dataset.
-\end{itemize}
-
-\subsection{Dynamic Kernel Generation}
-A Python transpiler converts \texttt{functions.txt} strings into CUDA C++ code. The pipeline involves:
+\subsection{Parallelization Strategy}
+To maximize GPU throughput, I employed a hybrid parallelism strategy that maps the GP workload to the GPU grid hierarchy:
 \begin{enumerate}
-    \item \textbf{Parsing:} Regex replaces mathematical tokens (e.g., \texttt{sinf}) and variable placeholders. Variables like \texttt{\_j\_} are mapped to specific offsets in the column-major input array (e.g., \texttt{data[idx + 9 * n\_rows]}).
-    \item \textbf{Injection:} The parsed code is injected into a C++ \texttt{switch} statement inside the kernel.
-    \item \textbf{Dispatcher:} A main kernel switches between functions based on \texttt{blockIdx.y}.
+    \item \textbf{Task Parallelism (Grid Y-Dimension):} Each block in the grid is assigned a specific \textit{function} (individual) from the population. The function index is derived from \texttt{blockIdx.y}.
+    \item \textbf{Data Parallelism (Grid X-Dimension \& Threads):} Threads within a block parallelize the loop over the dataset rows. The data index is calculated as \texttt{int idx = threadIdx.x}.
 \end{enumerate}
 
-\subsection{Automated Batch Size Tuning}
-A critical challenge in the Mega-Kernel approach is balancing compilation cost against execution speed.
+\subsection{Kernel and Thread Configuration}
+I utilized a block size of \textbf{256 threads} (\texttt{blockDim.x = 256}). This is a heuristic choice that provides sufficient warp occupancy (8 warps per block) to hide memory latency without exhausting register files.
 \begin{itemize}
-    \item \textbf{Too Large Batch:} Compiling a kernel with thousands of \texttt{case} statements takes excessive time and may hit compiler resource limits (register pressure).
-    \item \textbf{Too Small Batch:} Increases the number of kernel launches, re-introducing overhead.
+    \item \textbf{Grid-Stride Loop:} Since the dataset size ($N$) often exceeds 256, I implemented a Grid-Stride Loop. Threads iterate over the data with a stride of \texttt{blockDim.x}, allowing the kernel to handle arbitrary dataset sizes without reconfiguration.
 \end{itemize}
-Our implementation includes an automated tuning loop that tests batch sizes (e.g., 32, 64, ..., 512) to find the optimal balance. It measures both \texttt{compile\_time} and \texttt{execution\_time} to select the configuration that minimizes total time-to-solution.
 
-\section{Implementation Details}
-\subsection{Transpiler Implementation}
-The Python transpiler ensures that high-level symbolic expressions are converted into efficient CUDA C code.
+\subsection{Minimizing Kernels and Data Transfers}
+\textbf{Minimizing Data Transfers:}
+Data transfer between Host (CPU) and Device (GPU) is the slowest operation.
+\begin{itemize}
+    \item \textbf{Strategy:} I copy the training data (\texttt{data\_gpu} and \texttt{y\_gpu}) to the GPU \textbf{exactly once} at the start. These arrays persist on VRAM. Only the resulting \texttt{fitness\_scores} are transferred back to the CPU.
+    \item \textbf{Data Layout:} I utilize a \textbf{Column-Major} layout. This ensures that when threads in a warp read a feature (e.g., \texttt{x[0]}), they access contiguous memory addresses, enabling coalesced memory transactions.
+\end{itemize}
 
-\begin{lstlisting}[language=Python, caption=Python Transpiler Function]
+\textbf{Minimizing Kernel Calls (Kernel Fusion):}
+A naive approach launches one kernel per operator. For a population of 1000 and average size 50, this would require 50,000 launches.
+\begin{itemize}
+    \item \textbf{Strategy:} I implemented \textbf{Kernel Fusion} via dynamic transpilation. A Python transpiler converts symbolic strings into C++ CUDA code (Listing \ref{lst:transpiler}), injected into a \texttt{switch-case} statement inside a single kernel.
+\end{itemize}
+
+\begin{lstlisting}[language=Python, caption=Dynamic Transpiler Logic, label={lst:transpiler}]
 def transpile_to_cuda(line, features):
-    # Replace variables _a_ -> data[idx + offset]
     for i, c in enumerate(features):
-        # Map column char to array offset
-        offset = f"{i} * n_rows"
         line = line.replace(f"_{c}_", 
-            f"data[idx + {offset}]")
-    
-    # Replace functions with CUDA intrinsics
-    # Custom protected sqrt to handle negatives
-    line = line.replace("sqrtf", "p_sqrtf")
-    return line
+            f"data[idx + {i} * n_rows]")
+    # Map safe operators
+    return line.replace("sqrtf", "p_sqrtf")
 \end{lstlisting}
 
-\subsection{CUDA Mega-Kernel}
-The core of the implementation is the Mega-Kernel, which evaluates multiple functions in a single launch. It uses Shared Memory for efficient parallel reduction of the Mean Squared Error.
+\subsection{Shared Memory and Reduction}
+I used \textbf{Shared Memory} to perform the parallel reduction of the Mean Squared Error (MSE). Instead of global memory atomics, each thread calculates a partial sum in a register. These are reduced in a binary tree within shared memory (Listing \ref{lst:shared}).
 
-\begin{lstlisting}[language=C++, caption=CUDA Mega-Kernel Template]
-__device__ inline float p_sqrtf(float x) { 
-    return sqrtf(fabsf(x)); 
-}
-
-extern "C" __global__
-void evaluate_population(const float* data, 
-    const float* y_true, float* fitness_scores, 
-    int n_rows) {
-    
-    int func_idx = blockIdx.y; // Function ID
-    int tid = threadIdx.x;
-    float error_sum = 0.0f;
-
-    // Grid-stride loop over data rows
-    for (int idx = tid; idx < n_rows; 
-         idx += blockDim.x) {
-        float y_pred = 0.0f;
-        
-        // Dynamic Switch-Case Dispatch
-        switch(func_idx) {
-            // Cases injected by Python
-            case 0: y_pred = ...; break;
-            case 1: y_pred = ...; break;
-            // ...
-        }
-        
-        float diff = y_pred - y_true[idx];
-        error_sum += diff * diff;
-    }
-
-    // Block Reduction in Shared Memory
+\begin{lstlisting}[caption=Shared Memory Reduction, label={lst:shared}]
     __shared__ float sdata[256];
     sdata[tid] = error_sum;
     __syncthreads();
-
-    // Binary Tree Reduction
-    for (unsigned int s = blockDim.x / 2; 
-         s > 0; s >>= 1) {
-        if (tid < s) {
-            sdata[tid] += sdata[tid + s];
-        }
+    // Parallel reduction in shared memory
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) { sdata[tid] += sdata[tid + s]; }
         __syncthreads();
     }
-
-    // Write final MSE for this function
-    if (tid == 0) {
-        fitness_scores[func_idx + BLOCK_OFFSET] = 
-            sdata[0] / n_rows;
-    }
-}
 \end{lstlisting}
 
-\subsection{High-Precision Timing}
-To accurately measure the performance of sub-millisecond kernel executions, we replaced standard \texttt{time.time()} with \texttt{time.perf\_counter()}. This ensures that the benchmarking results capture the true execution cost without the noise of system clock granularity.
+\subsection{Handling Branch Conflicts (Warp Divergence)}
+\textbf{Solution:} The design avoids divergence entirely for the function logic. The switch statement depends on \texttt{func\_idx}, which corresponds to \texttt{blockIdx.y}. Since all threads in a block share the same \texttt{blockIdx.y}, every thread in the warp executes the exact same branch, maintaining SIMT efficiency.
+
+\section{Methodology}
+
+\subsection{Implementation Strategies}
+\subsubsection{Sequential CPU}
+A baseline Python implementation using \texttt{numpy} and \texttt{eval()}. To handle domain errors common in random genetic trees (e.g., $\sqrt{-x}$), I modified the evaluation logic to utilize \texttt{numpy.emath.sqrt}. This function returns complex numbers for negative inputs instead of raising exceptions. Consequently, the fitness function was adapted to calculate the Mean Squared Error using the squared magnitude of the complex residuals (\texttt{np.mean(np.abs(a - b)**2)}). While robust, this method suffers from significant Python interpreter overhead.
+
+\subsubsection{Naive CuPy}
+A high-level GPU implementation using \texttt{cupy} arrays. It leverages GPU bandwidth but issues a separate kernel launch for every node in the expression tree (e.g., \texttt{sin}, \texttt{add}). For a population of 1000 individuals with average size 50, this results in 50,000 kernel launches per generation, causing significant driver overhead.
+
+\subsubsection{Mega-Kernel (CUDA)}
+My proposed solution uses \texttt{CuPy.RawKernel} to compile the entire population evaluation into a single (or few) kernel launches. The transpiler converts expression strings into C++ CUDA code, injected into a \texttt{switch} statement. This "Kernel Fusion" eliminates launch overhead and keeps data in GPU registers/shared memory.
 
 \section{Experimental Analysis}
-We conducted a comprehensive performance analysis covering three key dimensions.
 
-\subsection{Batch Size Optimization}
-We swept batch sizes from 32 to 512 functions per kernel.
+\subsection{Setup and Metrics}
+All experiments were conducted on the \textbf{Google Colab} platform using a runtime environment equipped with \textbf{Python 3.12.12} and an \textbf{NVIDIA A100-SXM4-40GB} GPU.
+
+I used a dataset varying from $N=10^2$ to $N=10^8$ rows and $D=15$ features. The Sequential CPU baseline was excluded from benchmarks where $N > 10^6$, as the system RAM usage exceeded 10 GB, causing runtime instability. Metrics include Execution Time, Speedup, MSE, Compile Time, and Power Consumption.
+
+\subsection{Performance Benchmarking}
+The Mega-Kernel approach consistently outperformed the CPU baseline across all scales.
 \begin{itemize}
-    \item \textbf{Observation:} Larger batches reduce execution time by amortizing launch overhead but increase compilation time significantly.
-    \item \textbf{Result:} The system automatically selects the batch size that offers the best trade-off (typically around 64-128 functions) for the final benchmark.
+    \item \textbf{Execution Speed:} For the standard benchmark ($N=100k$), the Mega-Kernel achieved a mean time of \textbf{0.0024s}, compared to \textbf{2.78s} for the CPU.
+    \item \textbf{Batch Optimization:} The optimal batch size was found to be \textbf{512 functions} per kernel. This incurred a high initial compilation time ($\approx 108$ seconds) but maximized runtime execution efficiency.
 \end{itemize}
 
-\subsection{Crossover Point Analysis (Scaling $N$)}
-We analyzed the "Crossover Point"—the dataset size ($N$) at which the GPU outperforms the CPU.
-\begin{itemize}
-    \item \textbf{Small $N$ ($<10^3$):} CPU is faster due to GPU data transfer and kernel launch latency.
-    \item \textbf{Large $N$ ($>10^4$):} GPU throughput dominates.
-    \item \textbf{Conclusion:} For modern datasets ($N=10^5+$), GPU acceleration is essential.
-\end{itemize}
-
-\subsection{Feature Scaling Analysis (Scaling $D$)}
-We investigated how the number of input features ($D \in \{5, 10, 15, 20\}$) impacts performance.
-\begin{itemize}
-    \item \textbf{CPU:} Performance degrades linearly as expression complexity increases with more variables.
-    \item \textbf{GPU:} Performance remains relatively stable due to high memory bandwidth and the column-major layout, which ensures efficient memory access regardless of feature count.
-\end{itemize}
-
-\section{Results Summary}
-We benchmarked the implementations on a dataset with $N=100,000$ rows.
-
-\begin{table}[h]
-\centering
-\begin{tabular}{|l|r|r|r|}
-\hline
-\textbf{Method} & \textbf{Time (s)} & \textbf{Speedup} \\ \hline
-Sequential CPU & $\approx 145.0$ & 1.0x \\ \hline
-Naive CuPy & $\approx 4.5$ & 32.2x \\ \hline
-CUDA Mega-Kernel & $\approx 0.12$ & 1210.0x \\ \hline
-\end{tabular}
-\caption{Performance Comparison ($N=10^5$)}
-\label{tab:results}
+\begin{table}[htbp]
+    \centering
+    \small % Forces uniform small font size
+    \caption{Speedup and Accuracy Summary (N=100,000)}
+    \label{tab:speedup}
+    \input{../data/speedup_summary.tex}
 \end{table}
 
-As shown in Table \ref{tab:results}, the Mega-Kernel approach provides a dramatic speedup. The Naive CuPy implementation is faster than CPU but suffers from kernel launch overhead for each individual in the population. The Mega-Kernel eliminates this, reducing the cost to effectively a single kernel launch.
+\subsection{Statistical Significance}
+Mann-Whitney U tests confirm that the performance differences are statistically significant ($p < 0.05$).
 
-\section{Future Work}
-\subsection{Constant Optimization}
-Currently, the system evolves structure but not constants (e.g., $3.14 \times x$). Future work will integrate a local search (e.g., Gradient Descent or Hill Climbing) to optimize constants for each skeleton.
+\begin{table}[htbp]
+    \centering
+    \small % Forces uniform small font size
+    \caption{Statistical Significance Tests}
+    \label{tab:stats}
+    \input{../data/mann_whitney_stats.tex}
+\end{table}
 
-\subsection{Multi-GPU Scaling}
-The "Mega-Kernel" design is naturally parallelizable across multiple GPUs. We plan to implement \texttt{cupy.cuda.nccl} to distribute the population across devices, allowing for larger populations ($P > 10,000$).
+\subsection{Scalability Analysis}
 
-\subsection{Advanced Genetic Operators}
-Moving Crossover and Mutation operations to the GPU would eliminate the remaining D2H transfers, keeping the entire evolutionary loop on the device.
+\subsubsection{Crossover Point and High-Volume Data}
+The GPU outperforms the CPU even at $N=100$. However, a distinct interaction was observed between Naive CuPy and the Mega-Kernel (Figure \ref{fig:crossover}):
+
+\begin{itemize}
+    \item \textbf{Low N ($<10^6$):} Mega-Kernel is dominant.
+    \item \textbf{The $10^7$ Inversion:} At $N=10^7$, Naive CuPy (0.0289s) briefly outperformed the Mega-Kernel (0.0842s). This is hypothesized to be due to register pressure in the fused kernel reducing occupancy compared to the simpler, dedicated kernels used by Naive CuPy.
+    \item \textbf{Massive N ($10^8$):} At the largest scale, the Mega-Kernel (0.82s) regained superiority over Naive CuPy (1.13s), while the CPU implementation failed entirely due to RAM exhaustion.
+\end{itemize}
+
+\subsubsection{Feature Scaling}
+Figure \ref{fig:features} demonstrates that the Mega-Kernel performance is effectively \textbf{invariant} to feature count. As features increased from 5 to 20, execution time remained stable at $\approx 7 \times 10^{-4}s$.
+
+\subsection{Environmental Impact}
+Table \ref{tab:metrics} shows that while the GPU draws more instantaneous power, the massive reduction in execution time results in significantly lower total energy per evaluation.
+
+\begin{table}[htbp]
+    \centering
+    \small % Forces uniform small font size
+    \caption{GPU Environmental Metrics}
+    \label{tab:metrics}
+    \input{../data/gpu_metrics_table.tex}
+\end{table}
+
+\subsection{Compilation Overhead vs. Runtime}
+The "tuning" phase revealed a critical trade-off. The high compilation time (108s for batch 512) is mitigated by CuPy's caching mechanism. Subsequent runs utilized the cached kernel, resulting in near-instant load times ($0.0005s$). This validates the architecture for GP, where the same large batch of functions is evaluated repeatedly.
+
+\section{Discussion and Future Work}
+
+\subsection{Optimizing the Genetic Programming Loop}
+Integrating this kernel into a full evolutionary loop (Evaluation, Tournament, Crossover, Mutation) requires minimizing Host-Device latency. I propose the following adaptations:
+\begin{enumerate}
+    \item \textbf{Persistent Data:} Training data remains on VRAM indefinitely, eliminating the $O(N \times D)$ transfer cost per generation.
+    \item \textbf{JIT Caching:} The fast, cached compilation must be leveraged. I would employ an ``Elitism'' check to reuse compiled binaries for survivors, avoiding the large initial compilation penalty.
+    \item \textbf{Async Execution:} Use \texttt{cp.cuda.Stream} to overlap CPU-heavy tasks (selection logic) with GPU evaluation, hiding the Python interpreter overhead.
+\end{enumerate}
+
+\subsection{Future Work: Thread Block Tuning}
+In this implementation, the block size was hardcoded to 256 threads. Future work should focus on implementing an \textbf{Occupancy Calculator} to dynamically select the block size (e.g., 128 or 512) that maximizes active warps based on the specific register usage of the generated kernel. This optimization would address the performance dip observed at $N=10^7$.
 
 \section{Conclusion}
-The hybrid Python/CuPy/RawKernel architecture successfully accelerates Symbolic Regression. By optimizing memory layout (Column-Major) and using dynamic compilation (Mega-Kernel), we eliminate common bottlenecks like "bad stride" and kernel launch latency. This enables real-time evolution of complex models on consumer-grade GPUs, fulfilling the project's high-performance computing objectives.
+This project demonstrated the efficacy of a custom CUDA ``Mega-Kernel'' for accelerating Symbolic Regression. By fusing thousands of candidate functions into single kernel launches, I overcame the latency bottlenecks inherent in high-level libraries and sequential processing. The architecture not only achieved a speedup of over $1000\times$ against the CPU baseline but also enabled the processing of massive datasets ($N=10^8$) that were previously intractable. Although trade-offs regarding compilation time and register pressure were identified at intermediate scales, the proposed solution satisfies all assignment objectives—delivering a robust, scalable, and massively parallel evaluation engine ready for integration into high-performance Genetic Programming workflows.
+
+\newpage
+\appendix
+\section{Appendix: Figures}
+\label{sec:appendix_figures}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.9\textwidth]{benchmark_plot.png}
+    \caption{Performance Distribution (Log Scale)}
+    \label{fig:benchmark}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.9\textwidth]{crossover_plot.png}
+    \caption{Crossover Point: Execution Time vs Dataset Size (N)}
+    \label{fig:crossover}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.9\textwidth]{feature_scaling_plot.png}
+    \caption{Impact of Feature Count on Performance}
+    \label{fig:features}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.9\textwidth]{tuning_curve.png}
+    \caption{Batch Size Tuning Curve: Compile Time vs Execution Time}
+    \label{fig:tuning}
+\end{figure}
 
 \end{document}
